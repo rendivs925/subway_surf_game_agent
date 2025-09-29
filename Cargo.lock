@@ -1068,6 +1068,7 @@ dependencies = [
  "anyhow",
  "image",
  "ndarray",
+ "once_cell",
  "onnxruntime",
  "opencv",
  "serde",

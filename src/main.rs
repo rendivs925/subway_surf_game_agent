@@ -1,10 +1,19 @@
 use anyhow::Result;
 use opencv::{core, imgproc, prelude::*, videoio};
 use onnxruntime::{environment::Environment, session::Session, GraphOptimizationLevel, LoggingLevel};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::sleep;
+
+static ORT_ENV: Lazy<Environment> = Lazy::new(|| {
+    Environment::builder()
+        .with_name("subway_surfers_detector")
+        .with_log_level(LoggingLevel::Warning)
+        .build()
+        .expect("Failed to create ONNX Runtime environment")
+});
 
 // Vision module - handles frame capture and YOLO detection
 mod vision {
@@ -54,18 +63,12 @@ mod vision {
     }
 
     pub struct YoloDetector {
-        environment: Environment,
-        session: Option<Session<'static>>,
+        session: Session<'static>,
         class_names: Vec<String>,
     }
 
     impl YoloDetector {
         pub fn new(model_path: &str) -> Result<Self> {
-            let environment = Environment::builder()
-                .with_name("subway_surfers_detector")
-                .with_log_level(LoggingLevel::Warning)
-                .build()?;
-
             let class_names = vec![
                 "player".to_string(),
                 "coin".to_string(),
@@ -76,22 +79,16 @@ mod vision {
                 "barrier_ground".to_string(),
             ];
 
-            // Create detector without session first, then add session later
-            let mut detector = Self {
-                environment,
-                session: None,
-                class_names
-            };
-
-            // Now create session using the stored environment
-            let session = detector.environment
+            let session = ORT_ENV
                 .new_session_builder()?
                 .with_optimization_level(GraphOptimizationLevel::All)?
                 .with_number_threads(4)?
-                .with_model_from_file(model_path)?;
+                .with_model_from_file(model_path.to_string())?;
 
-            detector.session = Some(session);
-            Ok(detector)
+            Ok(Self {
+                session,
+                class_names,
+            })
         }
 
         pub fn detect(&mut self, frame: &core::Mat) -> Result<Vec<Detection>> {
@@ -115,12 +112,18 @@ mod vision {
             let input_array = self.mat_to_array(&rgb)?;
             let input_tensor = input_array.into_owned();
 
-            // Run inference
-            let session = self.session.as_mut().ok_or_else(|| anyhow::anyhow!("Session not initialized"))?;
-            let outputs = session.run(vec![input_tensor])?;
+            // Extract frame dimensions before running inference
+            let frame_width = frame.cols() as f32;
+            let frame_height = frame.rows() as f32;
+
+            // Run inference and extract output data
+            let output_view = {
+                let outputs = self.session.run(vec![input_tensor])?;
+                outputs[0].view().to_owned()
+            };
 
             // Parse YOLO outputs
-            self.parse_yolo_outputs(&outputs[0], frame.cols() as f32, frame.rows() as f32)
+            self.parse_yolo_outputs(&output_view.view(), frame_width, frame_height)
         }
 
         fn mat_to_array(&self, mat: &core::Mat) -> Result<ndarray::Array4<f32>> {
