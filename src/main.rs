@@ -36,18 +36,39 @@ mod vision {
 
     pub struct FrameCapture {
         cap: videoio::VideoCapture,
+        source: String,
     }
 
     impl FrameCapture {
         pub fn new() -> Result<Self> {
-            // Use scrcpy pipe - assumes scrcpy is running in headless mode
-            // Command: scrcpy --no-display --record=- | ffmpeg -i - -f rawvideo -pix_fmt bgr24 -
-            let mut cap = videoio::VideoCapture::new(0, videoio::CAP_ANY)?;
+            // Try to open scrcpy v4l2loopback device first (/dev/video2)
+            let mut cap = videoio::VideoCapture::new(2, videoio::CAP_V4L2)?;
+            let mut source = "/dev/video2 (scrcpy v4l2loopback)".to_string();
+
+            if !cap.is_opened()? {
+                println!("⚠️  Failed to open /dev/video2, trying fallback to /dev/video0...");
+
+                // Fallback to default camera device
+                cap = videoio::VideoCapture::new(0, videoio::CAP_V4L2)?;
+                source = "/dev/video0 (fallback)".to_string();
+
+                if !cap.is_opened()? {
+                    return Err(anyhow::anyhow!(
+                        "Failed to open both /dev/video2 and /dev/video0. \
+                        Make sure scrcpy is running with --v4l2-sink=/dev/video2 or a camera is connected."
+                    ));
+                }
+            }
+
+            // Configure capture properties
             cap.set(videoio::CAP_PROP_FRAME_WIDTH, 720.0)?;
             cap.set(videoio::CAP_PROP_FRAME_HEIGHT, 1280.0)?;
             cap.set(videoio::CAP_PROP_FPS, 30.0)?;
+            cap.set(videoio::CAP_PROP_BUFFERSIZE, 1.0)?; // Reduce buffer for lower latency
 
-            Ok(Self { cap })
+            println!("✅ Frame capture initialized using: {}", source);
+
+            Ok(Self { cap, source })
         }
 
         pub fn capture_frame(&mut self) -> Result<core::Mat> {
@@ -55,10 +76,17 @@ mod vision {
             self.cap.read(&mut frame)?;
 
             if frame.empty() {
-                return Err(anyhow::anyhow!("Empty frame captured"));
+                return Err(anyhow::anyhow!(
+                    "Empty frame captured from {}. Check if scrcpy is running with --v4l2-sink=/dev/video2",
+                    self.source
+                ));
             }
 
             Ok(frame)
+        }
+
+        pub fn get_source(&self) -> &str {
+            &self.source
         }
     }
 
