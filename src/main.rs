@@ -1,14 +1,13 @@
 use anyhow::Result;
-use opencv::{core, imgproc, prelude::*, videoio, imgcodecs};
-use onnxruntime::{environment::Environment, session::Session, GraphOptimizationLevel, LoggingLevel};
 use once_cell::sync::Lazy;
+use onnxruntime::{environment::Environment, LoggingLevel};
+use opencv::prelude::*;
+use opencv::{core, imgproc, videoio};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::sleep;
-
-// Import our advanced detection system
-use subway_surfers_bot::detection::detect_objects_for_game;
+// Import configuration (assumed to exist)
 use subway_surfers_bot::config::{apply_profile, with_config};
 
 static ORT_ENV: Lazy<Environment> = Lazy::new(|| {
@@ -19,9 +18,179 @@ static ORT_ENV: Lazy<Environment> = Lazy::new(|| {
         .expect("Failed to create ONNX Runtime environment")
 });
 
-// Vision module - handles frame capture and YOLO detection
+// COCO class names for YOLO
+fn coco80() -> Vec<String> {
+    vec![
+        "person",
+        "bicycle",
+        "car",
+        "motorcycle",
+        "airplane",
+        "bus",
+        "train",
+        "truck",
+        "boat",
+        "traffic light",
+        "fire hydrant",
+        "stop sign",
+        "parking meter",
+        "bench",
+        "bird",
+        "cat",
+        "dog",
+        "horse",
+        "sheep",
+        "cow",
+        "elephant",
+        "bear",
+        "zebra",
+        "giraffe",
+        "backpack",
+        "umbrella",
+        "handbag",
+        "tie",
+        "suitcase",
+        "frisbee",
+        "skis",
+        "snowboard",
+        "sports ball",
+        "kite",
+        "baseball bat",
+        "baseball glove",
+        "skateboard",
+        "surfboard",
+        "tennis racket",
+        "bottle",
+        "wine glass",
+        "cup",
+        "fork",
+        "knife",
+        "spoon",
+        "bowl",
+        "banana",
+        "apple",
+        "sandwich",
+        "orange",
+        "broccoli",
+        "carrot",
+        "hot dog",
+        "pizza",
+        "donut",
+        "cake",
+        "chair",
+        "couch",
+        "potted plant",
+        "bed",
+        "dining table",
+        "toilet",
+        "tv",
+        "laptop",
+        "mouse",
+        "remote",
+        "keyboard",
+        "cell phone",
+        "microwave",
+        "oven",
+        "toaster",
+        "sink",
+        "refrigerator",
+        "book",
+        "clock",
+        "vase",
+        "scissors",
+        "teddy bear",
+        "hair drier",
+        "toothbrush",
+    ]
+    .into_iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+// Map COCO labels to game-specific classes
+fn map_coco_to_game(label: &str) -> Option<&'static str> {
+    match label {
+        "person" => Some("player"),
+        "train" | "bus" | "truck" => Some("train_blocking"),
+        "bench" | "couch" | "chair" | "dining table" => Some("barrier_ground"),
+        "stop sign" | "tv" => Some("barrier_overhead"),
+        _ => None,
+    }
+}
+
+struct Letterbox {
+    scale: f32,
+    pad_x: f32,
+    pad_y: f32,
+}
+
+fn letterbox_bgr_to_rgb_nchw(
+    frame: &core::Mat,
+    new_size: i32,
+) -> Result<(ndarray::Array4<f32>, Letterbox)> {
+    let (w, h) = (frame.cols() as f32, frame.rows() as f32);
+    let s = (new_size as f32 / w).min(new_size as f32 / h);
+    let nw = (w * s).round() as i32;
+    let nh = (h * s).round() as i32;
+    let px = ((new_size - nw) / 2).max(0);
+    let py = ((new_size - nh) / 2).max(0);
+
+    let mut resized = core::Mat::default();
+    imgproc::resize(
+        frame,
+        &mut resized,
+        core::Size::new(nw, nh),
+        0.0,
+        0.0,
+        imgproc::INTER_LINEAR,
+    )?;
+
+    let padded = core::Mat::zeros(new_size, new_size, frame.typ())?;
+    let roi = core::Rect::new(px, py, nw, nh);
+    let padded_mat = padded.to_mat()?;
+    let roi_ref = core::Mat::roi(&padded_mat, roi)?;
+    let mut dst_roi = roi_ref.try_clone()?;
+    resized.copy_to(&mut dst_roi)?;
+
+    let mut rgb = core::Mat::default();
+    imgproc::cvt_color(
+        &padded,
+        &mut rgb,
+        imgproc::COLOR_BGR2RGB,
+        0,
+        core::AlgorithmHint::ALGO_HINT_DEFAULT,
+    )?;
+    let size = rgb.size()?;
+    let mut arr = ndarray::Array4::<f32>::zeros((1, 3, size.height as usize, size.width as usize));
+
+    unsafe {
+        let data = rgb.ptr(0)? as *const u8;
+        for y in 0..size.height as usize {
+            for x in 0..size.width as usize {
+                let i = (y * size.width as usize + x) * 3;
+                let r = *data.add(i) as f32 / 255.0;
+                let g = *data.add(i + 1) as f32 / 255.0;
+                let b = *data.add(i + 2) as f32 / 255.0;
+                arr[[0, 0, y, x]] = r;
+                arr[[0, 1, y, x]] = g;
+                arr[[0, 2, y, x]] = b;
+            }
+        }
+    }
+
+    Ok((
+        arr,
+        Letterbox {
+            scale: s,
+            pad_x: px as f32,
+            pad_y: py as f32,
+        },
+    ))
+}
+
 mod vision {
     use super::*;
+    use onnxruntime::session::Session;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Detection {
@@ -41,269 +210,305 @@ mod vision {
     pub struct FrameCapture {
         cap: videoio::VideoCapture,
         source: String,
+        width: f32,
+        height: f32,
+        max_retries: u32,
+        retry_delay: Duration,
     }
 
     impl FrameCapture {
         pub fn new() -> Result<Self> {
-            // Try to open scrcpy v4l2loopback device first (/dev/video2)
-            let mut cap = videoio::VideoCapture::new(2, videoio::CAP_V4L2)?;
-            let mut source = "/dev/video2 (scrcpy v4l2loopback)".to_string();
+            let max_retries = 3;
+            let retry_delay = Duration::from_millis(100);
 
-            if !cap.is_opened()? {
-                println!("⚠️  Failed to open /dev/video2, trying fallback to /dev/video0...");
+            let devices = [(2, "/dev/video2"), (3, "/dev/video3"), (0, "/dev/video0")];
+            let mut cap: Option<videoio::VideoCapture> = None;
+            let mut source = String::new();
 
-                // Fallback to default camera device
-                cap = videoio::VideoCapture::new(0, videoio::CAP_V4L2)?;
-                source = "/dev/video0 (fallback)".to_string();
+            for (device_id, device_name) in devices.iter() {
+                println!("🔍 Trying V4L2 device: {}", device_name);
+                match videoio::VideoCapture::new(*device_id, videoio::CAP_V4L2) {
+                    Ok(mut c) if c.is_opened()? => {
+                        // Set optimal properties but don't force specific resolution
+                        c.set(videoio::CAP_PROP_FPS, 90.0)?;
+                        c.set(videoio::CAP_PROP_BUFFERSIZE, 1.0)?;
 
-                if !cap.is_opened()? {
-                    return Err(anyhow::anyhow!(
-                        "Failed to open both /dev/video2 and /dev/video0. \
-                        Make sure scrcpy is running with --v4l2-sink=/dev/video2 or a camera is connected."
-                    ));
+                        let width = c.get(videoio::CAP_PROP_FRAME_WIDTH)? as f32;
+                        let height = c.get(videoio::CAP_PROP_FRAME_HEIGHT)? as f32;
+
+                        // Accept any reasonable resolution (minimum 480p)
+                        if width >= 480.0 && height >= 360.0 {
+                            cap = Some(c);
+                            source = format!("{} (scrcpy v4l2loopback)", device_name);
+                            println!("✅ Using device {} with resolution {}x{}", device_name, width, height);
+                            break;
+                        } else {
+                            println!(
+                                "⚠️  Device {} resolution {}x{} too small (minimum 480x360)",
+                                device_name, width, height
+                            );
+                        }
+                    }
+                    Ok(_) => {
+                        println!("⚠️  Device {} opened but not usable", device_name);
+                    }
+                    Err(e) => {
+                        println!("⚠️  Failed to open {}: {}", device_name, e);
+                    }
                 }
             }
 
-            // Configure capture properties
-            cap.set(videoio::CAP_PROP_FRAME_WIDTH, 720.0)?;
-            cap.set(videoio::CAP_PROP_FRAME_HEIGHT, 1280.0)?;
-            cap.set(videoio::CAP_PROP_FPS, 30.0)?;
-            cap.set(videoio::CAP_PROP_BUFFERSIZE, 1.0)?; // Reduce buffer for lower latency
+            let cap = cap.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Failed to open any V4L2 device. Ensure scrcpy is running with --v4l2-sink=/dev/video2 --fullscreen --max-fps=90."
+                )
+            })?;
 
-            println!("✅ Frame capture initialized using: {}", source);
-
-            Ok(Self { cap, source })
-        }
-
-        pub fn capture_frame(&mut self) -> Result<core::Mat> {
-            let mut frame = core::Mat::default();
-            self.cap.read(&mut frame)?;
-
-            if frame.empty() {
+            let width = cap.get(videoio::CAP_PROP_FRAME_WIDTH)? as f32;
+            let height = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as f32;
+            if width == 0.0 || height == 0.0 {
                 return Err(anyhow::anyhow!(
-                    "Empty frame captured from {}. Check if scrcpy is running with --v4l2-sink=/dev/video2",
-                    self.source
+                    "Invalid resolution detected from capture device"
                 ));
             }
 
-            Ok(frame)
+            println!(
+                "✅ Frame capture initialized using: {}, resolution: {}x{}, FPS: 90",
+                source, width, height
+            );
+
+            Ok(Self {
+                cap,
+                source,
+                width,
+                height,
+                max_retries,
+                retry_delay,
+            })
+        }
+
+        pub fn capture_frame(&mut self) -> Result<core::Mat> {
+            for attempt in 1..=self.max_retries {
+                let mut frame = core::Mat::default();
+                match self.cap.read(&mut frame) {
+                    Ok(_) if !frame.empty() => {
+                        let frame_width = frame.cols() as f32;
+                        let frame_height = frame.rows() as f32;
+                        // Accept frames that match the device resolution (no strict validation)
+                        if frame_width == self.width && frame_height == self.height {
+                            return Ok(frame);
+                        } else {
+                            println!(
+                                "⚠️  Frame size {}x{} does not match device {}x{}, attempt {}/{}",
+                                frame_width,
+                                frame_height,
+                                self.width,
+                                self.height,
+                                attempt,
+                                self.max_retries
+                            );
+                        }
+                    }
+                    Ok(_) => {
+                        println!(
+                            "⚠️  Empty frame captured from {}, attempt {}/{}",
+                            self.source, attempt, self.max_retries
+                        );
+                    }
+                    Err(e) => {
+                        println!(
+                            "❌ Frame capture error from {}: {}, attempt {}/{}",
+                            self.source, e, attempt, self.max_retries
+                        );
+                    }
+                }
+                std::thread::sleep(self.retry_delay);
+            }
+            Err(anyhow::anyhow!(
+                "Failed to capture frame from {} after {} attempts",
+                self.source,
+                self.max_retries
+            ))
         }
 
         pub fn get_source(&self) -> &str {
             &self.source
+        }
+
+        pub fn get_resolution(&self) -> (f32, f32) {
+            (self.width, self.height)
         }
     }
 
     pub struct YoloDetector {
         session: Session<'static>,
         class_names: Vec<String>,
+        conf_threshold: f32,
+        nms_threshold: f32,
     }
 
     impl YoloDetector {
-        pub fn new(model_path: &str) -> Result<Self> {
-            let class_names = vec![
-                "player".to_string(),
-                "coin".to_string(),
-                "train_blocking".to_string(),
-                "train_jumpable".to_string(),
-                "train_free".to_string(),
-                "barrier_overhead".to_string(),
-                "barrier_ground".to_string(),
-            ];
-
+        pub fn new(model_path: String) -> Result<Self> {
+            let class_names = coco80();
             let session = ORT_ENV
                 .new_session_builder()?
-                .with_optimization_level(GraphOptimizationLevel::All)?
+                .with_optimization_level(onnxruntime::GraphOptimizationLevel::All)?
                 .with_number_threads(4)?
-                .with_model_from_file(model_path.to_string())?;
-
+                .with_model_from_file(model_path)?;
             Ok(Self {
                 session,
                 class_names,
+                conf_threshold: 0.25,
+                nms_threshold: 0.45,
             })
         }
 
         pub fn detect(&mut self, frame: &core::Mat) -> Result<Vec<Detection>> {
-            let mut all_detections = Vec::new();
-
-            // 1. Run YOLO detection for trained objects
-            let yolo_detections = self.detect_yolo(frame)?;
-            all_detections.extend(yolo_detections);
-
-            // 2. Run advanced computer vision detection for additional objects
-            let cv_detections = self.detect_computer_vision(frame)?;
-            all_detections.extend(cv_detections);
-
-            // 3. Remove duplicates and apply NMS across all detections
-            Ok(self.apply_nms(all_detections, 0.4))
-        }
-
-        fn detect_yolo(&mut self, frame: &core::Mat) -> Result<Vec<Detection>> {
-            // Preprocess frame for YOLO
             let input_size = 640;
-            let mut resized = core::Mat::default();
-            imgproc::resize(
-                frame,
-                &mut resized,
-                core::Size::new(input_size, input_size),
-                0.0,
-                0.0,
-                imgproc::INTER_LINEAR,
-            )?;
+            let (input_tensor, lb) = letterbox_bgr_to_rgb_nchw(frame, input_size)?;
 
-            // Convert BGR to RGB and normalize
-            let mut rgb = core::Mat::default();
-            imgproc::cvt_color(&resized, &mut rgb, imgproc::COLOR_BGR2RGB, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
-
-            // Convert to NCHW format for ONNX
-            let input_array = self.mat_to_array(&rgb)?;
-            let input_tensor = input_array.into_owned();
-
-            // Extract frame dimensions before running inference
             let frame_width = frame.cols() as f32;
             let frame_height = frame.rows() as f32;
 
-            // Run inference and extract output data
             let output_view = {
                 let outputs = self.session.run(vec![input_tensor])?;
                 outputs[0].view().to_owned()
             };
 
-            // Parse YOLO outputs
-            self.parse_yolo_outputs(&output_view.view(), frame_width, frame_height)
+            let mut dets =
+                self.parse_yolo_outputs(&output_view.view(), input_size as f32, input_size as f32)?;
+
+            for d in dets.iter_mut() {
+                let cx = d.bbox.x + d.bbox.width * 0.5;
+                let cy = d.bbox.y + d.bbox.height * 0.5;
+                let cx0 = (cx - lb.pad_x) / lb.scale;
+                let cy0 = (cy - lb.pad_y) / lb.scale;
+                let w0 = d.bbox.width / lb.scale;
+                let h0 = d.bbox.height / lb.scale;
+                d.bbox.x = cx0 - w0 * 0.5;
+                d.bbox.y = cy0 - h0 * 0.5;
+                d.bbox.width = w0;
+                d.bbox.height = h0;
+                d.bbox.x = d.bbox.x.max(0.0).min(frame_width - 1.0);
+                d.bbox.y = d.bbox.y.max(0.0).min(frame_height - 1.0);
+            }
+
+            if dets.is_empty() {
+                println!("🔍 YOLO produced 0 mapped detections this frame");
+            } else {
+                let labels: Vec<_> = dets.iter().map(|d| d.class_name.as_str()).collect();
+                println!("✅ YOLO mapped detections: {}", labels.join(", "));
+            }
+            Ok(self.apply_nms(dets))
         }
 
-        fn detect_computer_vision(&self, frame: &core::Mat) -> Result<Vec<Detection>> {
-            // Convert Mat to bytes for the computer vision detection system
-            let mut buf = core::Vector::<u8>::new();
-            imgcodecs::imencode(".jpg", frame, &mut buf, &core::Vector::new())?;
-            let frame_bytes = buf.to_vec();
+        fn parse_yolo_outputs(
+            &self,
+            output: &onnxruntime::ndarray::ArrayViewD<f32>,
+            img_width: f32,
+            img_height: f32,
+        ) -> Result<Vec<Detection>> {
+            use ndarray::{Axis, Ix3};
+            let mut out = Vec::new();
 
-            // Use the advanced detection system
-            let json_result = detect_objects_for_game(&frame_bytes, "subway");
-            match serde_json::from_str::<serde_json::Value>(&json_result) {
-                Ok(json_value) => {
-                    let mut detections = Vec::new();
+            if output.ndim() != 3 || output.shape()[0] != 1 {
+                return Err(anyhow::anyhow!(
+                    "Unexpected YOLO output shape: {:?}",
+                    output.shape()
+                ));
+            }
 
-                    // Parse JSON and convert CV detections to our Detection format
-                    if let Some(detection_array) = json_value.get("detections").and_then(|d| d.as_array()) {
-                        for detection in detection_array {
-                            if let (Some(object_type), Some(confidence), Some(x1), Some(y1), Some(x2), Some(y2)) = (
-                                detection.get("object_type").and_then(|v| v.as_str()),
-                                detection.get("confidence").and_then(|v| v.as_f64()),
-                                detection.get("x1").and_then(|v| v.as_f64()),
-                                detection.get("y1").and_then(|v| v.as_f64()),
-                                detection.get("x2").and_then(|v| v.as_f64()),
-                                detection.get("y2").and_then(|v| v.as_f64())
-                            ) {
-                                detections.push(Detection {
-                                    class_name: object_type.to_string(),
-                                    confidence: confidence as f32,
-                                    bbox: BoundingBox {
-                                        x: x1 as f32,
-                                        y: y1 as f32,
-                                        width: (x2 - x1) as f32,
-                                        height: (y2 - y1) as f32,
-                                    },
-                                });
-                            }
-                        }
+            let need_transpose = {
+                let s1 = output.shape()[1];
+                let s2 = output.shape()[2];
+                (s1 == 84 || s1 == 85) && !(s2 == 84 || s2 == 85)
+            };
+
+            let v = output.to_owned();
+            let arr3 = v.into_dimensionality::<Ix3>().map_err(|_| {
+                anyhow::anyhow!("Expected 3D YOLO output, got {:?}", output.shape())
+            })?;
+
+            let arr3 = if need_transpose {
+                arr3.permuted_axes([0, 2, 1])
+            } else {
+                arr3
+            };
+
+            let pred = arr3.index_axis(Axis(0), 0);
+            let n_boxes = pred.dim().0;
+            let c_dim = pred.dim().1;
+
+            let has_objness =
+                c_dim == 85 || (c_dim > 10 && c_dim - 4 - self.class_names.len() == 1);
+            let base = 4usize;
+            let class_start = if has_objness { base + 1 } else { base };
+            let num_classes = c_dim - class_start;
+
+            let use_labels: Vec<String> = if num_classes == self.class_names.len() {
+                self.class_names.clone()
+            } else {
+                (0..num_classes).map(|i| format!("cls_{}", i)).collect()
+            };
+
+            let input_size = 640.0;
+            let sx = img_width / input_size;
+            let sy = img_height / input_size;
+
+            let mut candidates: Vec<(f32, f32, f32, f32, usize, f32)> = Vec::new();
+            for i in 0..n_boxes {
+                let cx = pred[[i, 0]];
+                let cy = pred[[i, 1]];
+                let w = pred[[i, 2]];
+                let h = pred[[i, 3]];
+                let obj = if has_objness { pred[[i, base]] } else { 1.0 };
+
+                let mut best_cls = 0usize;
+                let mut best_score = 0.0f32;
+                for c in 0..num_classes {
+                    let s = pred[[i, class_start + c]];
+                    let sc = s * obj;
+                    if sc > best_score {
+                        best_score = sc;
+                        best_cls = c;
                     }
-
-                    Ok(detections)
                 }
-                Err(e) => {
-                    // Don't fail the whole pipeline if CV detection fails
-                    eprintln!("⚠️  Computer vision detection failed: {}", e);
-                    Ok(Vec::new())
-                }
-            }
-        }
-
-        fn mat_to_array(&self, mat: &core::Mat) -> Result<ndarray::Array4<f32>> {
-            let size = mat.size()?;
-            let mut array = ndarray::Array4::<f32>::zeros((1, 3, size.height as usize, size.width as usize));
-
-            unsafe {
-                let data = mat.ptr(0)? as *const u8;
-                for y in 0..size.height as usize {
-                    for x in 0..size.width as usize {
-                        let pixel_idx = (y * size.width as usize + x) * 3;
-                        let r = *data.add(pixel_idx + 2) as f32 / 255.0;
-                        let g = *data.add(pixel_idx + 1) as f32 / 255.0;
-                        let b = *data.add(pixel_idx) as f32 / 255.0;
-
-                        array[[0, 0, y, x]] = r;
-                        array[[0, 1, y, x]] = g;
-                        array[[0, 2, y, x]] = b;
-                    }
-                }
-            }
-
-            Ok(array)
-        }
-
-        fn parse_yolo_outputs(&self, output: &onnxruntime::ndarray::ArrayViewD<f32>, img_width: f32, img_height: f32) -> Result<Vec<Detection>> {
-            let mut detections = Vec::new();
-            let confidence_threshold = 0.5;
-            let nms_threshold = 0.4;
-
-            // Assuming YOLOv5/v8 output format: [batch, 25200, 85] where 85 = 4 (bbox) + 1 (objectness) + 80 (classes)
-            // For our 7 classes: [batch, 25200, 12] where 12 = 4 (bbox) + 1 (objectness) + 7 (classes)
-
-            if output.ndim() != 3 {
-                return Err(anyhow::anyhow!("Unexpected output dimensions"));
-            }
-
-            let shape = output.shape();
-            let num_detections = shape[1];
-            let _num_features = shape[2];
-
-            for i in 0..num_detections {
-                let objectness = output[[0, i, 4]];
-                if objectness < confidence_threshold {
+                if best_score < self.conf_threshold {
                     continue;
                 }
 
-                // Find best class
-                let mut best_class_idx = 0;
-                let mut best_class_score = 0.0;
-                for j in 0..self.class_names.len() {
-                    let class_score = output[[0, i, 5 + j]];
-                    if class_score > best_class_score {
-                        best_class_score = class_score;
-                        best_class_idx = j;
-                    }
-                }
+                let cx_img = cx * sx;
+                let cy_img = cy * sy;
+                let w_img = w * sx;
+                let h_img = h * sy;
 
-                let final_confidence = objectness * best_class_score;
-                if final_confidence < confidence_threshold {
-                    continue;
-                }
+                let x = cx_img - w_img * 0.5;
+                let y = cy_img - h_img * 0.5;
 
-                // Parse bounding box (center_x, center_y, width, height)
-                let center_x = output[[0, i, 0]] * img_width / 640.0;
-                let center_y = output[[0, i, 1]] * img_height / 640.0;
-                let width = output[[0, i, 2]] * img_width / 640.0;
-                let height = output[[0, i, 3]] * img_height / 640.0;
-
-                let x = center_x - width / 2.0;
-                let y = center_y - height / 2.0;
-
-                detections.push(Detection {
-                    class_name: self.class_names[best_class_idx].clone(),
-                    confidence: final_confidence,
-                    bbox: BoundingBox { x, y, width, height },
-                });
+                candidates.push((x, y, w_img, h_img, best_cls, best_score));
             }
 
-            // Apply NMS
-            Ok(self.apply_nms(detections, nms_threshold))
+            for (x, y, w, h, cls, score) in candidates {
+                let raw = &use_labels[cls];
+                if let Some(mapped) = map_coco_to_game(raw.as_str()) {
+                    out.push(Detection {
+                        class_name: mapped.to_string(),
+                        confidence: score,
+                        bbox: BoundingBox {
+                            x,
+                            y,
+                            width: w,
+                            height: h,
+                        },
+                    });
+                }
+            }
+
+            Ok(out)
         }
 
-        fn apply_nms(&self, mut detections: Vec<Detection>, threshold: f32) -> Vec<Detection> {
+        fn apply_nms(&self, mut detections: Vec<Detection>) -> Vec<Detection> {
             detections.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
-
             let mut keep = Vec::new();
             let mut suppressed = vec![false; detections.len()];
 
@@ -320,7 +525,7 @@ mod vision {
                     }
 
                     let iou = self.calculate_iou(&detections[i].bbox, &detections[j].bbox);
-                    if iou > threshold {
+                    if iou > self.nms_threshold {
                         suppressed[j] = true;
                     }
                 }
@@ -349,7 +554,6 @@ mod vision {
     }
 }
 
-// Control module - handles ADB commands
 mod control {
     use super::*;
 
@@ -382,22 +586,29 @@ mod control {
         }
 
         async fn swipe_up(&self) -> Result<()> {
-            self.execute_swipe(500, 1500, 500, 500, 150).await
+            self.execute_swipe(540, 1750, 540, 750, 150).await
         }
 
         async fn swipe_down(&self) -> Result<()> {
-            self.execute_swipe(500, 500, 500, 1500, 150).await
+            self.execute_swipe(540, 750, 540, 1750, 150).await
         }
 
         async fn swipe_left(&self) -> Result<()> {
-            self.execute_swipe(800, 1000, 200, 1000, 150).await
+            self.execute_swipe(800, 1170, 300, 1170, 150).await
         }
 
         async fn swipe_right(&self) -> Result<()> {
-            self.execute_swipe(200, 1000, 800, 1000, 150).await
+            self.execute_swipe(300, 1170, 800, 1170, 150).await
         }
 
-        async fn execute_swipe(&self, x1: u32, y1: u32, x2: u32, y2: u32, duration: u32) -> Result<()> {
+        async fn execute_swipe(
+            &self,
+            x1: u32,
+            y1: u32,
+            x2: u32,
+            y2: u32,
+            duration: u32,
+        ) -> Result<()> {
             let mut cmd = Command::new("adb");
 
             if let Some(ref device) = self.device_id {
@@ -427,7 +638,6 @@ mod control {
     }
 }
 
-// Decision module - game logic
 mod decision {
     use super::*;
 
@@ -435,9 +645,10 @@ mod decision {
         screen_width: f32,
         screen_height: f32,
         lane_width: f32,
-        player_lane: i32, // 0=left, 1=center, 2=right
+        player_lane: i32,
         last_action_time: Instant,
         action_cooldown: Duration,
+        threat_conf_threshold: f32,
     }
 
     impl GameDecisionEngine {
@@ -446,32 +657,23 @@ mod decision {
                 screen_width,
                 screen_height,
                 lane_width: screen_width / 3.0,
-                player_lane: 1, // Start in center
+                player_lane: 1,
                 last_action_time: Instant::now(),
-                action_cooldown: Duration::from_millis(300),
+                action_cooldown: Duration::from_millis(200),
+                threat_conf_threshold: 0.3,
             }
         }
 
         pub fn decide_action(&mut self, detections: &[vision::Detection]) -> control::Action {
-            // Cooldown check
             if self.last_action_time.elapsed() < self.action_cooldown {
                 return control::Action::None;
             }
 
-            // Get player position to update current lane
             if let Some(player) = detections.iter().find(|d| d.class_name == "player") {
                 self.update_player_lane(&player.bbox);
             }
 
-            // Priority 1: Avoid immediate threats
             if let Some(action) = self.avoid_immediate_threats(detections) {
-                self.last_action_time = Instant::now();
-                self.update_player_lane_prediction(&action);
-                return action;
-            }
-
-            // Priority 2: Collect coins if safe
-            if let Some(action) = self.collect_coins_safely(detections) {
                 self.last_action_time = Instant::now();
                 self.update_player_lane_prediction(&action);
                 return action;
@@ -482,14 +684,13 @@ mod decision {
 
         fn update_player_lane(&mut self, player_bbox: &vision::BoundingBox) {
             let center_x = player_bbox.x + player_bbox.width / 2.0;
-
-            if center_x < self.lane_width {
-                self.player_lane = 0; // Left
+            self.player_lane = if center_x < self.lane_width {
+                0
             } else if center_x < self.lane_width * 2.0 {
-                self.player_lane = 1; // Center
+                1
             } else {
-                self.player_lane = 2; // Right
-            }
+                2
+            };
         }
 
         fn update_player_lane_prediction(&mut self, action: &control::Action) {
@@ -508,67 +709,41 @@ mod decision {
             }
         }
 
-        fn avoid_immediate_threats(&self, detections: &[vision::Detection]) -> Option<control::Action> {
-            let threat_distance = self.screen_height * 0.4; // Consider threats in bottom 40% of screen
+        fn avoid_immediate_threats(
+            &self,
+            detections: &[vision::Detection],
+        ) -> Option<control::Action> {
+            let threat_distance = self.screen_height * 0.35;
 
-            // Sort detections by proximity for priority handling
             let mut sorted_detections = detections.to_vec();
             sorted_detections.sort_by(|a, b| {
                 let dist_a = self.screen_height - (a.bbox.y + a.bbox.height);
                 let dist_b = self.screen_height - (b.bbox.y + b.bbox.height);
-                dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+                dist_a
+                    .partial_cmp(&dist_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
 
             for detection in &sorted_detections {
-                let distance_from_bottom = self.screen_height - (detection.bbox.y + detection.bbox.height);
+                if detection.confidence < self.threat_conf_threshold {
+                    continue;
+                }
 
+                let distance_from_bottom =
+                    self.screen_height - (detection.bbox.y + detection.bbox.height);
                 if distance_from_bottom > threat_distance {
-                    continue; // Too far away
+                    continue;
                 }
 
                 let object_lane = self.get_object_lane(&detection.bbox);
+                if object_lane != self.player_lane {
+                    continue;
+                }
 
                 match detection.class_name.as_str() {
-                    // YOLO detected objects
-                    "train_blocking" => {
-                        if object_lane == self.player_lane {
-                            return self.choose_safe_lane(detections, threat_distance);
-                        }
-                    }
-                    "train_jumpable" => {
-                        if object_lane == self.player_lane {
-                            return Some(control::Action::Jump);
-                        }
-                    }
-                    "barrier_overhead" => {
-                        if object_lane == self.player_lane {
-                            return Some(control::Action::Slide);
-                        }
-                    }
-                    "barrier_ground" => {
-                        if object_lane == self.player_lane {
-                            return Some(control::Action::Jump);
-                        }
-                    }
-                    // Computer vision detected objects
-                    "train" | "barrier" | "obstacle" => {
-                        if object_lane == self.player_lane {
-                            // Use confidence to decide action
-                            if detection.confidence > 0.8 {
-                                return self.choose_safe_lane(detections, threat_distance);
-                            }
-                        }
-                    }
-                    "overhead_barrier" | "overhead_sign" => {
-                        if object_lane == self.player_lane {
-                            return Some(control::Action::Slide);
-                        }
-                    }
-                    "ground_obstacle" => {
-                        if object_lane == self.player_lane {
-                            return Some(control::Action::Jump);
-                        }
-                    }
+                    "train_blocking" => return self.choose_safe_lane(detections, threat_distance),
+                    "barrier_overhead" => return Some(control::Action::Slide),
+                    "barrier_ground" => return Some(control::Action::Jump),
                     _ => {}
                 }
             }
@@ -576,13 +751,16 @@ mod decision {
             None
         }
 
-        fn choose_safe_lane(&self, detections: &[vision::Detection], threat_distance: f32) -> Option<control::Action> {
+        fn choose_safe_lane(
+            &self,
+            detections: &[vision::Detection],
+            threat_distance: f32,
+        ) -> Option<control::Action> {
             if self.player_lane == 0 {
                 return Some(control::Action::MoveRight);
             } else if self.player_lane == 2 {
                 return Some(control::Action::MoveLeft);
             } else {
-                // In center, choose safer side
                 let left_clear = self.is_lane_safe(detections, 0, threat_distance);
                 let right_clear = self.is_lane_safe(detections, 2, threat_distance);
 
@@ -591,123 +769,127 @@ mod decision {
                 } else if right_clear && !left_clear {
                     return Some(control::Action::MoveRight);
                 } else if left_clear && right_clear {
-                    return Some(control::Action::MoveLeft); // Default to left
+                    return Some(control::Action::MoveLeft);
                 }
             }
-            None
-        }
-
-        fn collect_coins_safely(&self, detections: &[vision::Detection]) -> Option<control::Action> {
-            let coin_distance = self.screen_height * 0.6; // Consider coins in bottom 60% of screen
-
-            for detection in detections {
-                if detection.class_name != "coin" {
-                    continue;
-                }
-
-                let distance_from_bottom = self.screen_height - (detection.bbox.y + detection.bbox.height);
-
-                if distance_from_bottom > coin_distance {
-                    continue; // Too far away
-                }
-
-                let coin_lane = self.get_object_lane(&detection.bbox);
-
-                if coin_lane != self.player_lane {
-                    // Check if target lane is safe
-                    if self.is_lane_safe(detections, coin_lane, coin_distance) {
-                        if coin_lane < self.player_lane {
-                            return Some(control::Action::MoveLeft);
-                        } else {
-                            return Some(control::Action::MoveRight);
-                        }
-                    }
-                }
-            }
-
             None
         }
 
         fn get_object_lane(&self, bbox: &vision::BoundingBox) -> i32 {
             let center_x = bbox.x + bbox.width / 2.0;
-
             if center_x < self.lane_width {
-                0 // Left
+                0
             } else if center_x < self.lane_width * 2.0 {
-                1 // Center
+                1
             } else {
-                2 // Right
+                2
             }
         }
 
-        fn is_lane_safe(&self, detections: &[vision::Detection], lane: i32, check_distance: f32) -> bool {
+        fn is_lane_safe(
+            &self,
+            detections: &[vision::Detection],
+            lane: i32,
+            check_distance: f32,
+        ) -> bool {
             for detection in detections {
-                let distance_from_bottom = self.screen_height - (detection.bbox.y + detection.bbox.height);
+                if detection.confidence < self.threat_conf_threshold {
+                    continue;
+                }
 
+                let distance_from_bottom =
+                    self.screen_height - (detection.bbox.y + detection.bbox.height);
                 if distance_from_bottom > check_distance {
                     continue;
                 }
 
                 let object_lane = self.get_object_lane(&detection.bbox);
-
                 if object_lane == lane {
                     match detection.class_name.as_str() {
-                        "train_blocking" | "barrier_overhead" | "barrier_ground" => {
-                            return false;
-                        }
+                        "train_blocking" | "barrier_overhead" | "barrier_ground" => return false,
                         _ => {}
                     }
                 }
             }
-
             true
         }
     }
 }
 
-// Main application
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("🎮 Subway Surfers Bot Starting...");
 
-    // Initialize configuration profile for Subway Surfers
+    let scrcpy_cmd = Command::new("scrcpy")
+        .args([
+            "--v4l2-sink=/dev/video2",
+            "--fullscreen",
+            "--max-fps=90",
+            "--no-audio",
+            "--no-control",
+            "--no-playback",
+        ])
+        .spawn();
+
+    if let Err(e) = scrcpy_cmd {
+        eprintln!(
+            "❌ Failed to start scrcpy: {}. Ensure scrcpy is installed and device is connected.",
+            e
+        );
+        return Err(anyhow::anyhow!("Scrcpy startup failed"));
+    }
+
+    sleep(Duration::from_millis(2000)).await;
+
     apply_profile("subway_surfers");
     println!("⚙️  Applied Subway Surfers detection profile");
 
-    // Initialize components
-    let mut frame_capture = vision::FrameCapture::new()
-        .map_err(|e| anyhow::anyhow!("Failed to initialize frame capture: {}. Make sure scrcpy is running.", e))?;
+    let mut frame_capture = vision::FrameCapture::new().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to initialize frame capture: {}. Ensure scrcpy is running.",
+            e
+        )
+    })?;
 
-    let mut yolo_detector = vision::YoloDetector::new("models/subway_surfers.onnx")
-        .map_err(|e| anyhow::anyhow!("Failed to load YOLO model: {}. Make sure the model file exists.", e))?;
+    let (screen_width, screen_height) = frame_capture.get_resolution();
+    let mut yolo_detector = vision::YoloDetector::new("models/subway_surfers.onnx".to_string())
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to load YOLO model: {}. Make sure the model file exists.",
+                e
+            )
+        })?;
 
-    let adb_controller = control::AdbController::new(None); // Auto-detect device
-
-    let mut decision_engine = decision::GameDecisionEngine::new(720.0, 1280.0);
+    let adb_controller = control::AdbController::new(None);
+    let mut decision_engine = decision::GameDecisionEngine::new(screen_width, screen_height);
 
     println!("✅ All components initialized successfully");
     println!("🚀 Starting game automation loop...");
 
     let mut frame_count = 0;
     let mut total_detections = 0;
-    let mut yolo_detections = 0;
-    let mut cv_detections = 0;
     let start_time = Instant::now();
+    let mut last_successful_frame = Instant::now();
+    let max_stall_duration = Duration::from_secs(5);
 
     loop {
         let loop_start = Instant::now();
 
-        // Capture frame
         let frame = match frame_capture.capture_frame() {
-            Ok(frame) => frame,
+            Ok(frame) => {
+                last_successful_frame = Instant::now();
+                frame
+            }
             Err(e) => {
                 eprintln!("❌ Frame capture error: {}", e);
-                sleep(Duration::from_millis(33)).await; // ~30 FPS
+                if last_successful_frame.elapsed() > max_stall_duration {
+                    return Err(anyhow::anyhow!("Frame capture stalled for too long"));
+                }
+                sleep(Duration::from_millis(33)).await;
                 continue;
             }
         };
 
-        // Run detection
         let detections = match yolo_detector.detect(&frame) {
             Ok(detections) => detections,
             Err(e) => {
@@ -719,54 +901,46 @@ async fn main() -> Result<()> {
 
         total_detections += detections.len();
 
-        // Count detection sources for stats
-        let yolo_count = detections.iter().filter(|d|
-            ["player", "coin", "train_blocking", "train_jumpable", "train_free",
-             "barrier_overhead", "barrier_ground"].contains(&d.class_name.as_str())
-        ).count();
-        yolo_detections += yolo_count;
-        cv_detections += detections.len() - yolo_count;
-
-        // Make decision
         let action = decision_engine.decide_action(&detections);
 
-        // Execute action
         if let Err(e) = adb_controller.execute_action(action.clone()).await {
             eprintln!("❌ ADB action error: {}", e);
         } else if !matches!(action, control::Action::None) {
-            println!("🎯 Executed action: {:?} (based on {} detections: {})",
+            println!(
+                "🎯 Executed action: {:?} (based on {} detections: {})",
                 action,
                 detections.len(),
-                detections.iter().map(|d| d.class_name.as_str()).collect::<Vec<_>>().join(", ")
+                detections
+                    .iter()
+                    .map(|d| d.class_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
 
         frame_count += 1;
 
-        // Print detailed stats every 100 frames
         if frame_count % 100 == 0 {
             let elapsed = start_time.elapsed();
             let fps = frame_count as f64 / elapsed.as_secs_f64();
             let avg_detections = total_detections as f64 / frame_count as f64;
-            let avg_yolo = yolo_detections as f64 / frame_count as f64;
-            let avg_cv = cv_detections as f64 / frame_count as f64;
 
             println!(
-                "📊 Stats: {} frames, {:.1} FPS, {:.1} total avg detections/frame (YOLO: {:.1}, CV: {:.1})",
-                frame_count, fps, avg_detections, avg_yolo, avg_cv
+                "📊 Stats: {} frames, {:.1} FPS, {:.1} avg detections/frame",
+                frame_count, fps, avg_detections
             );
 
-            // Print current config status
             with_config(|cfg| {
-                println!("⚙️  Config: latency_budget={}ms, crop_top={:.1}%",
-                    cfg.latency_budget_ms, cfg.crop_top_frac * 100.0);
+                println!(
+                    "⚙️  Config: latency_budget={}ms, crop_top={:.1}%",
+                    cfg.latency_budget_ms,
+                    cfg.crop_top_frac * 100.0
+                );
             });
         }
 
-        // Maintain target FPS (30 FPS = 33ms per frame)
         let loop_duration = loop_start.elapsed();
-        let target_frame_time = Duration::from_millis(33);
-
+        let target_frame_time = Duration::from_millis(11);
         if loop_duration < target_frame_time {
             sleep(target_frame_time - loop_duration).await;
         }

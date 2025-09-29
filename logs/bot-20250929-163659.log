@@ -1,0 +1,135 @@
+warning: variable does not need to be mutable
+   --> src/detection.rs:444:9
+    |
+444 |     let mut cur = segments[0];
+    |         ----^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+warning: unused variable: `hsv`
+   --> src/detection.rs:653:39
+    |
+653 | fn detect_mystery_hurdles(gray: &Mat, hsv: &Mat, w: i32, h: i32) -> opencv::Result<Vec<Detection>> {
+    |                                       ^^^ help: if this is intentional, prefix it with an underscore: `_hsv`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `tt`
+    --> src/detection.rs:1098:18
+     |
+1098 |     if let Some((tt, tb)) = exit_ok(
+     |                  ^^ help: if this is intentional, prefix it with an underscore: `_tt`
+
+warning: unused variable: `tt`
+    --> src/detection.rs:1110:18
+     |
+1110 |     if let Some((tt, tb)) = exit_ok(
+     |                  ^^ help: if this is intentional, prefix it with an underscore: `_tt`
+
+warning: unused variable: `tt`
+    --> src/detection.rs:1122:18
+     |
+1122 |     if let Some((tt, tb)) = exit_ok(
+     |                  ^^ help: if this is intentional, prefix it with an underscore: `_tt`
+
+warning: unused variable: `left`
+    --> src/detection.rs:1132:10
+     |
+1132 |     let (left, center, right) = lanes_snapshot(tracks, frame_w, frame_h);
+     |          ^^^^ help: if this is intentional, prefix it with an underscore: `_left`
+
+warning: unused variable: `right`
+    --> src/detection.rs:1132:24
+     |
+1132 |     let (left, center, right) = lanes_snapshot(tracks, frame_w, frame_h);
+     |                        ^^^^^ help: if this is intentional, prefix it with an underscore: `_right`
+
+warning: value assigned to `cx` is never read
+    --> src/detection.rs:1154:13
+     |
+1154 |     let mut cx = 0.0;
+     |             ^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` on by default
+
+warning: unused variable: `frame_bytes`
+    --> src/detection.rs:1308:22
+     |
+1308 | fn detect_hill_climb(frame_bytes: &[u8]) -> Result<DetectionResponse, Box<dyn std::error::Error>> {
+     |                      ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_frame_bytes`
+
+warning: unused variable: `frame_bytes`
+    --> src/detection.rs:1313:5
+     |
+1313 |     frame_bytes: &[u8],
+     |     ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_frame_bytes`
+
+warning: unused variable: `resp`
+    --> src/detection.rs:1318:23
+     |
+1318 | fn decide_hill_action(resp: &DetectionResponse) -> Option<ActionPlan> {
+     |                       ^^^^ help: if this is intentional, prefix it with an underscore: `_resp`
+
+warning: unused variable: `resp`
+    --> src/detection.rs:1322:26
+     |
+1322 | fn decide_general_action(resp: &DetectionResponse) -> Option<ActionPlan> {
+     |                          ^^^^ help: if this is intentional, prefix it with an underscore: `_resp`
+
+warning: `subway-surfers-bot` (lib) generated 12 warnings (run `cargo fix --lib -p subway-surfers-bot` to apply 1 suggestion)
+warning: unused variable: `scrcpy_cmd`
+   --> src/main.rs:832:13
+    |
+832 |     let mut scrcpy_cmd = Command::new("scrcpy")
+    |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_scrcpy_cmd`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+   --> src/main.rs:832:9
+    |
+832 |     let mut scrcpy_cmd = Command::new("scrcpy")
+    |         ----^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+warning: method `get_source` is never used
+   --> src/main.rs:335:16
+    |
+219 |     impl FrameCapture {
+    |     ----------------- method in this implementation
+...
+335 |         pub fn get_source(&self) -> &str {
+    |                ^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: field `screen_width` is never read
+   --> src/main.rs:646:9
+    |
+645 |     pub struct GameDecisionEngine {
+    |                ------------------ field in this struct
+646 |         screen_width: f32,
+    |         ^^^^^^^^^^^^
+
+warning: `subway-surfers-bot` (bin "subway-surfers-bot") generated 4 warnings (run `cargo fix --bin "subway-surfers-bot"` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 0.09s
+     Running `/home/rendi/.cache/cargo-target/subway_surf_game_agent/release/subway-surfers-bot`
+🎮 Subway Surfers Bot Starting...
+ERROR: Cannot request to turn screen off if control is disabled
+scrcpy 3.3.2 <https://github.com/Genymobile/scrcpy>
+⚙️  Applied Subway Surfers detection profile
+🔍 Trying V4L2 device: /dev/video2
+⚠️  Device /dev/video2 reports resolution 640x360, expected ~1080x2340
+🔍 Trying V4L2 device: /dev/video3
+[ WARN:0@3.115] global cap_v4l.cpp:914 open VIDEOIO(V4L2:/dev/video3): can't open camera by index
+[ WARN:0@3.115] global cap.cpp:478 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
+⚠️  Device /dev/video3 opened but not usable
+🔍 Trying V4L2 device: /dev/video0
+⚠️  Device /dev/video0 reports resolution 1280x720, expected ~1080x2340
+Error: Failed to initialize frame capture: Failed to open any V4L2 device. Ensure scrcpy is running with --v4l2-sink=/dev/video2 --fullscreen --max-fps=90.. Ensure scrcpy is running.
