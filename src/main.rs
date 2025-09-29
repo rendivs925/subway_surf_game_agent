@@ -1,11 +1,15 @@
 use anyhow::Result;
-use opencv::{core, imgproc, prelude::*, videoio};
+use opencv::{core, imgproc, prelude::*, videoio, imgcodecs};
 use onnxruntime::{environment::Environment, session::Session, GraphOptimizationLevel, LoggingLevel};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::sleep;
+
+// Import our advanced detection system
+use subway_surfers_bot::detection::detect_objects_for_game;
+use subway_surfers_bot::config::{apply_profile, with_config};
 
 static ORT_ENV: Lazy<Environment> = Lazy::new(|| {
     Environment::builder()
@@ -120,6 +124,21 @@ mod vision {
         }
 
         pub fn detect(&mut self, frame: &core::Mat) -> Result<Vec<Detection>> {
+            let mut all_detections = Vec::new();
+
+            // 1. Run YOLO detection for trained objects
+            let yolo_detections = self.detect_yolo(frame)?;
+            all_detections.extend(yolo_detections);
+
+            // 2. Run advanced computer vision detection for additional objects
+            let cv_detections = self.detect_computer_vision(frame)?;
+            all_detections.extend(cv_detections);
+
+            // 3. Remove duplicates and apply NMS across all detections
+            Ok(self.apply_nms(all_detections, 0.4))
+        }
+
+        fn detect_yolo(&mut self, frame: &core::Mat) -> Result<Vec<Detection>> {
             // Preprocess frame for YOLO
             let input_size = 640;
             let mut resized = core::Mat::default();
@@ -152,6 +171,53 @@ mod vision {
 
             // Parse YOLO outputs
             self.parse_yolo_outputs(&output_view.view(), frame_width, frame_height)
+        }
+
+        fn detect_computer_vision(&self, frame: &core::Mat) -> Result<Vec<Detection>> {
+            // Convert Mat to bytes for the computer vision detection system
+            let mut buf = core::Vector::<u8>::new();
+            imgcodecs::imencode(".jpg", frame, &mut buf, &core::Vector::new())?;
+            let frame_bytes = buf.to_vec();
+
+            // Use the advanced detection system
+            let json_result = detect_objects_for_game(&frame_bytes, "subway");
+            match serde_json::from_str::<serde_json::Value>(&json_result) {
+                Ok(json_value) => {
+                    let mut detections = Vec::new();
+
+                    // Parse JSON and convert CV detections to our Detection format
+                    if let Some(detection_array) = json_value.get("detections").and_then(|d| d.as_array()) {
+                        for detection in detection_array {
+                            if let (Some(object_type), Some(confidence), Some(x1), Some(y1), Some(x2), Some(y2)) = (
+                                detection.get("object_type").and_then(|v| v.as_str()),
+                                detection.get("confidence").and_then(|v| v.as_f64()),
+                                detection.get("x1").and_then(|v| v.as_f64()),
+                                detection.get("y1").and_then(|v| v.as_f64()),
+                                detection.get("x2").and_then(|v| v.as_f64()),
+                                detection.get("y2").and_then(|v| v.as_f64())
+                            ) {
+                                detections.push(Detection {
+                                    class_name: object_type.to_string(),
+                                    confidence: confidence as f32,
+                                    bbox: BoundingBox {
+                                        x: x1 as f32,
+                                        y: y1 as f32,
+                                        width: (x2 - x1) as f32,
+                                        height: (y2 - y1) as f32,
+                                    },
+                                });
+                            }
+                        }
+                    }
+
+                    Ok(detections)
+                }
+                Err(e) => {
+                    // Don't fail the whole pipeline if CV detection fails
+                    eprintln!("⚠️  Computer vision detection failed: {}", e);
+                    Ok(Vec::new())
+                }
+            }
         }
 
         fn mat_to_array(&self, mat: &core::Mat) -> Result<ndarray::Array4<f32>> {
@@ -445,7 +511,15 @@ mod decision {
         fn avoid_immediate_threats(&self, detections: &[vision::Detection]) -> Option<control::Action> {
             let threat_distance = self.screen_height * 0.4; // Consider threats in bottom 40% of screen
 
-            for detection in detections {
+            // Sort detections by proximity for priority handling
+            let mut sorted_detections = detections.to_vec();
+            sorted_detections.sort_by(|a, b| {
+                let dist_a = self.screen_height - (a.bbox.y + a.bbox.height);
+                let dist_b = self.screen_height - (b.bbox.y + b.bbox.height);
+                dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            for detection in &sorted_detections {
                 let distance_from_bottom = self.screen_height - (detection.bbox.y + detection.bbox.height);
 
                 if distance_from_bottom > threat_distance {
@@ -455,26 +529,10 @@ mod decision {
                 let object_lane = self.get_object_lane(&detection.bbox);
 
                 match detection.class_name.as_str() {
+                    // YOLO detected objects
                     "train_blocking" => {
                         if object_lane == self.player_lane {
-                            // Need to move to adjacent lane
-                            if self.player_lane == 0 {
-                                return Some(control::Action::MoveRight);
-                            } else if self.player_lane == 2 {
-                                return Some(control::Action::MoveLeft);
-                            } else {
-                                // In center, choose safer side
-                                let left_clear = self.is_lane_safe(detections, 0, threat_distance);
-                                let right_clear = self.is_lane_safe(detections, 2, threat_distance);
-
-                                if left_clear && !right_clear {
-                                    return Some(control::Action::MoveLeft);
-                                } else if right_clear && !left_clear {
-                                    return Some(control::Action::MoveRight);
-                                } else if left_clear && right_clear {
-                                    return Some(control::Action::MoveLeft); // Default to left
-                                }
-                            }
+                            return self.choose_safe_lane(detections, threat_distance);
                         }
                     }
                     "train_jumpable" => {
@@ -492,10 +550,50 @@ mod decision {
                             return Some(control::Action::Jump);
                         }
                     }
+                    // Computer vision detected objects
+                    "train" | "barrier" | "obstacle" => {
+                        if object_lane == self.player_lane {
+                            // Use confidence to decide action
+                            if detection.confidence > 0.8 {
+                                return self.choose_safe_lane(detections, threat_distance);
+                            }
+                        }
+                    }
+                    "overhead_barrier" | "overhead_sign" => {
+                        if object_lane == self.player_lane {
+                            return Some(control::Action::Slide);
+                        }
+                    }
+                    "ground_obstacle" => {
+                        if object_lane == self.player_lane {
+                            return Some(control::Action::Jump);
+                        }
+                    }
                     _ => {}
                 }
             }
 
+            None
+        }
+
+        fn choose_safe_lane(&self, detections: &[vision::Detection], threat_distance: f32) -> Option<control::Action> {
+            if self.player_lane == 0 {
+                return Some(control::Action::MoveRight);
+            } else if self.player_lane == 2 {
+                return Some(control::Action::MoveLeft);
+            } else {
+                // In center, choose safer side
+                let left_clear = self.is_lane_safe(detections, 0, threat_distance);
+                let right_clear = self.is_lane_safe(detections, 2, threat_distance);
+
+                if left_clear && !right_clear {
+                    return Some(control::Action::MoveLeft);
+                } else if right_clear && !left_clear {
+                    return Some(control::Action::MoveRight);
+                } else if left_clear && right_clear {
+                    return Some(control::Action::MoveLeft); // Default to left
+                }
+            }
             None
         }
 
@@ -572,6 +670,10 @@ mod decision {
 async fn main() -> Result<()> {
     println!("🎮 Subway Surfers Bot Starting...");
 
+    // Initialize configuration profile for Subway Surfers
+    apply_profile("subway_surfers");
+    println!("⚙️  Applied Subway Surfers detection profile");
+
     // Initialize components
     let mut frame_capture = vision::FrameCapture::new()
         .map_err(|e| anyhow::anyhow!("Failed to initialize frame capture: {}. Make sure scrcpy is running.", e))?;
@@ -588,6 +690,8 @@ async fn main() -> Result<()> {
 
     let mut frame_count = 0;
     let mut total_detections = 0;
+    let mut yolo_detections = 0;
+    let mut cv_detections = 0;
     let start_time = Instant::now();
 
     loop {
@@ -615,6 +719,14 @@ async fn main() -> Result<()> {
 
         total_detections += detections.len();
 
+        // Count detection sources for stats
+        let yolo_count = detections.iter().filter(|d|
+            ["player", "coin", "train_blocking", "train_jumpable", "train_free",
+             "barrier_overhead", "barrier_ground"].contains(&d.class_name.as_str())
+        ).count();
+        yolo_detections += yolo_count;
+        cv_detections += detections.len() - yolo_count;
+
         // Make decision
         let action = decision_engine.decide_action(&detections);
 
@@ -622,21 +734,33 @@ async fn main() -> Result<()> {
         if let Err(e) = adb_controller.execute_action(action.clone()).await {
             eprintln!("❌ ADB action error: {}", e);
         } else if !matches!(action, control::Action::None) {
-            println!("🎯 Executed action: {:?}", action);
+            println!("🎯 Executed action: {:?} (based on {} detections: {})",
+                action,
+                detections.len(),
+                detections.iter().map(|d| d.class_name.as_str()).collect::<Vec<_>>().join(", ")
+            );
         }
 
         frame_count += 1;
 
-        // Print stats every 100 frames
+        // Print detailed stats every 100 frames
         if frame_count % 100 == 0 {
             let elapsed = start_time.elapsed();
             let fps = frame_count as f64 / elapsed.as_secs_f64();
             let avg_detections = total_detections as f64 / frame_count as f64;
+            let avg_yolo = yolo_detections as f64 / frame_count as f64;
+            let avg_cv = cv_detections as f64 / frame_count as f64;
 
             println!(
-                "📊 Stats: {} frames, {:.1} FPS, {:.1} avg detections/frame",
-                frame_count, fps, avg_detections
+                "📊 Stats: {} frames, {:.1} FPS, {:.1} total avg detections/frame (YOLO: {:.1}, CV: {:.1})",
+                frame_count, fps, avg_detections, avg_yolo, avg_cv
             );
+
+            // Print current config status
+            with_config(|cfg| {
+                println!("⚙️  Config: latency_budget={}ms, crop_top={:.1}%",
+                    cfg.latency_budget_ms, cfg.crop_top_frac * 100.0);
+            });
         }
 
         // Maintain target FPS (30 FPS = 33ms per frame)
