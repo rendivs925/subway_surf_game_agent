@@ -1,4 +1,4 @@
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use std::sync::RwLock;
 
 #[derive(Clone, Debug)]
@@ -34,7 +34,7 @@ impl Default for Config {
     }
 }
 
-pub static CONFIG: Lazy<RwLock<Config>> = Lazy::new(|| RwLock::new(Config::default()));
+pub static CONFIG: LazyLock<RwLock<Config>> = LazyLock::new(|| RwLock::new(Config::default()));
 
 pub fn with_config<T>(f: impl FnOnce(&Config) -> T) -> T {
     let cfg = CONFIG.read().expect("config poisoned");

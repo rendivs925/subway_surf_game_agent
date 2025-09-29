@@ -1,8 +1,7 @@
 use anyhow::Result;
-use opencv::{core, imgcodecs, imgproc, prelude::*, videoio};
-use onnxruntime::{environment::Environment, ndarray::Array, session::Session, GraphOptimizationLevel, LoggingLevel};
+use opencv::{core, imgproc, prelude::*, videoio};
+use onnxruntime::{environment::Environment, session::Session, GraphOptimizationLevel, LoggingLevel};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::sleep;
@@ -55,7 +54,8 @@ mod vision {
     }
 
     pub struct YoloDetector {
-        session: Session<'static>,
+        environment: Environment,
+        session: Option<Session<'static>>,
         class_names: Vec<String>,
     }
 
@@ -65,12 +65,6 @@ mod vision {
                 .with_name("subway_surfers_detector")
                 .with_log_level(LoggingLevel::Warning)
                 .build()?;
-
-            let session = environment
-                .new_session_builder()?
-                .with_optimization_level(GraphOptimizationLevel::All)?
-                .with_number_threads(4)?
-                .with_model_from_file(model_path)?;
 
             let class_names = vec![
                 "player".to_string(),
@@ -82,10 +76,25 @@ mod vision {
                 "barrier_ground".to_string(),
             ];
 
-            Ok(Self { session, class_names })
+            // Create detector without session first, then add session later
+            let mut detector = Self {
+                environment,
+                session: None,
+                class_names
+            };
+
+            // Now create session using the stored environment
+            let session = detector.environment
+                .new_session_builder()?
+                .with_optimization_level(GraphOptimizationLevel::All)?
+                .with_number_threads(4)?
+                .with_model_from_file(model_path)?;
+
+            detector.session = Some(session);
+            Ok(detector)
         }
 
-        pub fn detect(&self, frame: &core::Mat) -> Result<Vec<Detection>> {
+        pub fn detect(&mut self, frame: &core::Mat) -> Result<Vec<Detection>> {
             // Preprocess frame for YOLO
             let input_size = 640;
             let mut resized = core::Mat::default();
@@ -100,14 +109,15 @@ mod vision {
 
             // Convert BGR to RGB and normalize
             let mut rgb = core::Mat::default();
-            imgproc::cvt_color(&resized, &mut rgb, imgproc::COLOR_BGR2RGB, 0)?;
+            imgproc::cvt_color(&resized, &mut rgb, imgproc::COLOR_BGR2RGB, 0, core::AlgorithmHint::ALGO_HINT_DEFAULT)?;
 
             // Convert to NCHW format for ONNX
             let input_array = self.mat_to_array(&rgb)?;
-            let input_tensor = onnxruntime::ndarray::CowArray::from(input_array);
+            let input_tensor = input_array.into_owned();
 
             // Run inference
-            let outputs = self.session.run(vec![input_tensor])?;
+            let session = self.session.as_mut().ok_or_else(|| anyhow::anyhow!("Session not initialized"))?;
+            let outputs = session.run(vec![input_tensor])?;
 
             // Parse YOLO outputs
             self.parse_yolo_outputs(&outputs[0], frame.cols() as f32, frame.rows() as f32)
@@ -150,7 +160,7 @@ mod vision {
 
             let shape = output.shape();
             let num_detections = shape[1];
-            let num_features = shape[2];
+            let _num_features = shape[2];
 
             for i in 0..num_detections {
                 let objectness = output[[0, i, 4]];
@@ -535,7 +545,7 @@ async fn main() -> Result<()> {
     let mut frame_capture = vision::FrameCapture::new()
         .map_err(|e| anyhow::anyhow!("Failed to initialize frame capture: {}. Make sure scrcpy is running.", e))?;
 
-    let yolo_detector = vision::YoloDetector::new("models/subway_surfers.onnx")
+    let mut yolo_detector = vision::YoloDetector::new("models/subway_surfers.onnx")
         .map_err(|e| anyhow::anyhow!("Failed to load YOLO model: {}. Make sure the model file exists.", e))?;
 
     let adb_controller = control::AdbController::new(None); // Auto-detect device

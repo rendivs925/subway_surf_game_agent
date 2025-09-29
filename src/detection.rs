@@ -1,6 +1,6 @@
 // subway_detect.rs (optimized for known objects in Subway Surfers)
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use opencv::{
     core::{self, Mat, Rect, Scalar, Size, Vector},
     imgcodecs::{imdecode, IMREAD_COLOR},
@@ -852,7 +852,7 @@ struct Track {
     seen_count: usize,
 }
 
-static SUBWAY_TRACKS: Lazy<Mutex<Vec<Track>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static SUBWAY_TRACKS: LazyLock<Mutex<Vec<Track>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 fn decide_action(game: &str, resp: &DetectionResponse) -> Option<ActionPlan> {
     if resp.detections.is_empty() || resp.frame_width <= 0 || resp.frame_height <= 0 {
